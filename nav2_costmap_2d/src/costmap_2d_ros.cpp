@@ -134,6 +134,7 @@ void Costmap2DROS::init()
   declare_parameter("update_frequency", rclcpp::ParameterValue(5.0));
   declare_parameter("use_maximum", rclcpp::ParameterValue(false));
   declare_parameter("clearable_layers", rclcpp::ParameterValue(clearable_layers));
+  declare_parameter("update_on_request", rclcpp::ParameterValue(false));
 }
 
 Costmap2DROS::~Costmap2DROS()
@@ -279,11 +280,17 @@ Costmap2DROS::on_activate(const rclcpp_lifecycle::State & /*state*/)
   // Create a thread to handle updating the map
   stopped_ = true;  // to active plugins
   stop_updates_ = false;
-  map_update_thread_shutdown_ = false;
-  map_update_thread_ = std::make_unique<std::thread>(
-    std::bind(&Costmap2DROS::mapUpdateLoop, this, map_update_frequency_));
+  if (!update_on_request_) {
+    mapUpdateThreadOn();
+  } else {
+    initialized_ = true;
+  }
 
   start();
+
+  if (update_on_request_) {
+    updateAndPublishMap();
+  }
 
   // Add callback for dynamic parameters
   dyn_params_handler = this->add_on_set_parameters_callback(
@@ -309,8 +316,9 @@ Costmap2DROS::on_deactivate(const rclcpp_lifecycle::State & /*state*/)
   stop();
 
   // Map thread stuff
-  map_update_thread_shutdown_ = true;
-  map_update_thread_->join();
+  if (!update_on_request_) {
+    mapUpdateThreadOff();
+  }
 
   return nav2_util::CallbackReturn::SUCCESS;
 }
@@ -371,6 +379,7 @@ Costmap2DROS::getParameters()
   get_parameter("width", map_width_meters_);
   get_parameter("plugins", plugin_names_);
   get_parameter("filters", filter_names_);
+  get_parameter("update_on_request", update_on_request_);
 
   auto node = shared_from_this();
 
@@ -447,6 +456,23 @@ Costmap2DROS::getOrientedFootprint(std::vector<geometry_msgs::msg::Point> & orie
 }
 
 void
+Costmap2DROS::mapUpdateThreadOn()
+{
+  map_update_thread_shutdown_ = false;
+  map_update_thread_ = std::make_unique<std::thread>(
+    std::bind(&Costmap2DROS::mapUpdateLoop, this, map_update_frequency_));
+}
+
+void
+Costmap2DROS::mapUpdateThreadOff()
+{
+  map_update_thread_shutdown_ = true;
+  if (map_update_thread_) {
+    map_update_thread_->join();
+  }
+}
+
+void
 Costmap2DROS::mapUpdateLoop(double frequency)
 {
   RCLCPP_DEBUG(get_logger(), "mapUpdateLoop frequency: %lf", frequency);
@@ -461,42 +487,7 @@ Costmap2DROS::mapUpdateLoop(double frequency)
   rclcpp::WallRate r(frequency);    // 200ms by default
 
   while (rclcpp::ok() && !map_update_thread_shutdown_) {
-    nav2_util::ExecutionTimer timer;
-
-    // Execute after start() will complete plugins activation
-    if (!stopped_) {
-      // Measure the execution time of the updateMap method
-      timer.start();
-      updateMap();
-      timer.end();
-
-      RCLCPP_DEBUG(get_logger(), "Map update time: %.9f", timer.elapsed_time_in_seconds());
-      if (publish_cycle_ > rclcpp::Duration(0s) && layered_costmap_->isInitialized()) {
-        unsigned int x0, y0, xn, yn;
-        layered_costmap_->getBounds(&x0, &xn, &y0, &yn);
-        costmap_publisher_->updateBounds(x0, xn, y0, yn);
-
-        for (auto & layer_pub: layer_publishers_) {
-          layer_pub->updateBounds(x0, xn, y0, yn);
-        }
-
-        auto current_time = now();
-        if ((last_publish_ + publish_cycle_ < current_time) ||  // publish_cycle_ is due
-          (current_time <
-          last_publish_))      // time has moved backwards, probably due to a switch to sim_time // NOLINT
-        {
-          RCLCPP_DEBUG(get_logger(), "Publish costmap at %s", name_.c_str());
-          costmap_publisher_->publishCostmap();
-
-          for (auto & layer_pub: layer_publishers_) {
-            layer_pub->publishCostmap();
-          }
-
-          last_publish_ = current_time;
-        }
-      }
-    }
-
+    updateAndPublishMap();
     // Make sure to sleep for the remainder of our cycle time
     r.sleep();
 
@@ -535,6 +526,49 @@ Costmap2DROS::updateMap()
       initialized_ = true;
     }
   }
+}
+
+void
+Costmap2DROS::updateAndPublishMap()
+{
+  if (stopped_) {
+    // Do not execute if start() did not complete plugins activation
+    return;
+  }
+
+  nav2_util::ExecutionTimer timer;
+
+  // Measure the execution time of the updateMap method
+  timer.start();
+  updateMap();
+  timer.end();
+
+  RCLCPP_DEBUG(get_logger(), "Map update time: %.9f", timer.elapsed_time_in_seconds());
+  if (publish_cycle_ > rclcpp::Duration(0s) && layered_costmap_->isInitialized()) {
+    unsigned int x0, y0, xn, yn;
+    layered_costmap_->getBounds(&x0, &xn, &y0, &yn);
+    costmap_publisher_->updateBounds(x0, xn, y0, yn);
+
+    for (auto & layer_pub: layer_publishers_) {
+      layer_pub->updateBounds(x0, xn, y0, yn);
+    }
+
+    auto current_time = now();
+    if ((last_publish_ + publish_cycle_ < current_time) ||  // publish_cycle_ is due
+      (current_time <
+      last_publish_))      // time has moved backwards, probably due to a switch to sim_time // NOLINT
+    {
+      RCLCPP_DEBUG(get_logger(), "Publish costmap at %s", name_.c_str());
+      costmap_publisher_->publishCostmap();
+
+      for (auto & layer_pub: layer_publishers_) {
+        layer_pub->publishCostmap();
+      }
+
+      last_publish_ = current_time;
+    }
+  }
+
 }
 
 void
@@ -747,6 +781,15 @@ Costmap2DROS::dynamicParametersCallback(std::vector<rclcpp::Parameter> parameter
           return result;
         }
         robot_base_frame_ = parameter.as_string();
+      }
+    } else if (type == ParameterType::PARAMETER_BOOL) {
+      if (name == "update_on_request") {
+        update_on_request_ = parameter.as_bool();
+        if (update_on_request_) {
+          mapUpdateThreadOff();
+        } else {
+          mapUpdateThreadOn();
+        }
       }
     }
   }
